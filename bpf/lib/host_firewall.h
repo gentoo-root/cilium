@@ -14,41 +14,44 @@
 # include "trace.h"
 
 # ifdef ENABLE_IPV6
-static __always_inline int
-ipv6_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
-			struct trace_ctx *trace, __s8 *ext_err)
+static __always_inline void
+ipv6_host_policy_egress_lookup(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
+			       struct ct_buffer6 *ct_buffer)
 {
-	int ret, verdict, l3_off = ETH_HLEN, l4_off, hdrlen;
-	struct ct_state ct_state_new = {}, ct_state = {};
+	int l3_off = ETH_HLEN, l4_off, hdrlen;
+	struct ipv6_ct_tuple *tuple = &ct_buffer->tuple;
+
+	/* Lookup connection in conntrack map. */
+	tuple->nexthdr = ip6->nexthdr;
+	ipv6_addr_copy(&tuple->saddr, (union v6addr *)&ip6->saddr);
+	ipv6_addr_copy(&tuple->daddr, (union v6addr *)&ip6->daddr);
+	hdrlen = ipv6_hdrlen(ctx, &tuple->nexthdr);
+	if (hdrlen < 0) {
+		ct_buffer->ret = hdrlen;
+		return;
+	}
+	l4_off = l3_off + hdrlen;
+	ct_buffer->ret = ct_lookup6(get_ct_map6(tuple), tuple, ctx, l4_off, CT_EGRESS,
+				    &ct_buffer->ct_state, &ct_buffer->monitor);
+}
+
+static __always_inline int
+__ipv6_host_policy_egress(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
+			  struct ct_buffer6 *ct_buffer,
+			  struct trace_ctx *trace, __s8 *ext_err)
+{
+	struct ct_state ct_state_new = {};
+	struct ct_state *ct_state = &ct_buffer->ct_state;
+	struct ipv6_ct_tuple *tuple = &ct_buffer->tuple;
+	int ret = ct_buffer->ret;
+	int verdict;
 	__u8 policy_match_type = POLICY_MATCH_NONE;
 	__u8 audited = 0;
 	struct remote_endpoint_info *info;
-	struct ipv6_ct_tuple tuple = {};
 	__u32 dst_id = 0;
-	void *data, *data_end;
-	struct ipv6hdr *ip6;
 	__u16 proxy_port = 0;
 
-	/* Only enforce host policies for packets from host IPs. */
-	if (src_id != HOST_ID)
-		return CTX_ACT_OK;
-
-	if (!revalidate_data(ctx, &data, &data_end, &ip6))
-		return DROP_INVALID;
-
-	/* Lookup connection in conntrack map. */
-	tuple.nexthdr = ip6->nexthdr;
-	ipv6_addr_copy(&tuple.saddr, (union v6addr *)&ip6->saddr);
-	ipv6_addr_copy(&tuple.daddr, (union v6addr *)&ip6->daddr);
-	hdrlen = ipv6_hdrlen(ctx, &tuple.nexthdr);
-	if (hdrlen < 0)
-		return hdrlen;
-	l4_off = l3_off + hdrlen;
-	ret = ct_lookup6(get_ct_map6(&tuple), &tuple, ctx, l4_off, CT_EGRESS,
-			 &ct_state, &trace->monitor);
-	if (ret < 0)
-		return ret;
-
+	trace->monitor = ct_buffer->monitor;
 	trace->reason = (enum trace_reason)ret;
 
 	/* Retrieve destination identity. */
@@ -63,28 +66,50 @@ ipv6_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
 		return CTX_ACT_OK;
 
 	/* Perform policy lookup. */
-	verdict = policy_can_egress6(ctx, &tuple, src_id, dst_id,
+	verdict = policy_can_egress6(ctx, tuple, HOST_ID, dst_id,
 				     &policy_match_type, &audited, ext_err, &proxy_port);
 
 	/* Only create CT entry for accepted connections, or when auth is required */
 	if (ret == CT_NEW && (verdict == CTX_ACT_OK || verdict == DROP_POLICY_AUTH_REQUIRED)) {
 		ct_state_new.src_sec_id = HOST_ID;
-		ret = ct_create6(get_ct_map6(&tuple), &CT_MAP_ANY6, &tuple,
+		ret = ct_create6(get_ct_map6(tuple), &CT_MAP_ANY6, tuple,
 				 ctx, CT_EGRESS, &ct_state_new, proxy_port > 0, false,
 				 verdict == DROP_POLICY_AUTH_REQUIRED);
 		if (IS_ERR(ret))
 			return ret;
-	} else if (verdict == DROP_POLICY_AUTH_REQUIRED && !ct_state.auth_required) {
+	} else if (verdict == DROP_POLICY_AUTH_REQUIRED && !ct_state->auth_required) {
 		/* Accept if policy states auth is required and CT states it is granted. */
 		verdict = CTX_ACT_OK;
 	}
 
 	/* Emit verdict if drop or if allow for CT_NEW or CT_REOPENED. */
 	if (verdict != CTX_ACT_OK || ret != CT_ESTABLISHED)
-		send_policy_verdict_notify(ctx, dst_id, tuple.dport,
-					   tuple.nexthdr, POLICY_EGRESS, 1,
+		send_policy_verdict_notify(ctx, dst_id, tuple->dport,
+					   tuple->nexthdr, POLICY_EGRESS, 1,
 					   verdict, proxy_port, policy_match_type, audited);
 	return verdict;
+}
+
+static __always_inline int
+ipv6_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
+			struct trace_ctx *trace, __s8 *ext_err)
+{
+	struct ct_buffer6 ct_buffer = {};
+	void *data, *data_end;
+	struct ipv6hdr *ip6;
+
+	/* Only enforce host policies for packets from host IPs. */
+	if (src_id != HOST_ID)
+		return CTX_ACT_OK;
+
+	if (!revalidate_data(ctx, &data, &data_end, &ip6))
+		return DROP_INVALID;
+
+	ipv6_host_policy_egress_lookup(ctx, ip6, &ct_buffer);
+	if (ct_buffer.ret < 0)
+		return ct_buffer.ret;
+
+	return __ipv6_host_policy_egress(ctx, ip6, &ct_buffer, trace, ext_err);
 }
 
 static __always_inline bool
@@ -255,45 +280,39 @@ whitelist_snated_egress_connections(struct __ctx_buff *ctx, __u32 ipcache_srcid,
 }
 #   endif
 
-static __always_inline int
-ipv4_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
-			__u32 ipcache_srcid __maybe_unused,
-			struct trace_ctx *trace, __s8 *ext_err)
+static __always_inline void
+ipv4_host_policy_egress_lookup(struct __ctx_buff *ctx, struct iphdr *ip4,
+			       struct ct_buffer4 *ct_buffer)
 {
-	struct ct_state ct_state_new = {}, ct_state = {};
-	int ret, verdict, l4_off, l3_off = ETH_HLEN;
+	int l4_off, l3_off = ETH_HLEN;
+	struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
+
+	/* Lookup connection in conntrack map. */
+	tuple->nexthdr = ip4->protocol;
+	tuple->daddr = ip4->daddr;
+	tuple->saddr = ip4->saddr;
+	l4_off = l3_off + ipv4_hdrlen(ip4);
+	ct_buffer->ret = ct_lookup4(get_ct_map4(tuple), tuple, ctx, l4_off, CT_EGRESS,
+				    &ct_buffer->ct_state, &ct_buffer->monitor);
+}
+
+static __always_inline int
+__ipv4_host_policy_egress(struct __ctx_buff *ctx, struct iphdr *ip4,
+			  struct ct_buffer4 *ct_buffer,
+			  struct trace_ctx *trace, __s8 *ext_err)
+{
+	struct ct_state ct_state_new = {};
+	struct ct_state *ct_state = &ct_buffer->ct_state;
+	struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
+	int ret = ct_buffer->ret;
+	int verdict;
 	__u8 policy_match_type = POLICY_MATCH_NONE;
 	__u8 audited = 0;
 	struct remote_endpoint_info *info;
-	struct ipv4_ct_tuple tuple = {};
 	__u32 dst_id = 0;
-	void *data, *data_end;
-	struct iphdr *ip4;
 	__u16 proxy_port = 0;
 
-	if (src_id != HOST_ID) {
-#  ifndef ENABLE_MASQUERADE
-		return whitelist_snated_egress_connections(ctx, ipcache_srcid,
-							   trace);
-#  else
-		/* Only enforce host policies for packets from host IPs. */
-		return CTX_ACT_OK;
-#  endif
-	}
-
-	if (!revalidate_data(ctx, &data, &data_end, &ip4))
-		return DROP_INVALID;
-
-	/* Lookup connection in conntrack map. */
-	tuple.nexthdr = ip4->protocol;
-	tuple.daddr = ip4->daddr;
-	tuple.saddr = ip4->saddr;
-	l4_off = l3_off + ipv4_hdrlen(ip4);
-	ret = ct_lookup4(get_ct_map4(&tuple), &tuple, ctx, l4_off, CT_EGRESS,
-			 &ct_state, &trace->monitor);
-	if (ret < 0)
-		return ret;
-
+	trace->monitor = ct_buffer->monitor;
 	trace->reason = (enum trace_reason)ret;
 
 	/* Retrieve destination identity. */
@@ -308,28 +327,57 @@ ipv4_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
 		return CTX_ACT_OK;
 
 	/* Perform policy lookup. */
-	verdict = policy_can_egress4(ctx, &tuple, src_id, dst_id,
+	verdict = policy_can_egress4(ctx, tuple, HOST_ID, dst_id,
 				     &policy_match_type, &audited, ext_err, &proxy_port);
 
 	/* Only create CT entry for accepted connections, or when auth is required */
 	if (ret == CT_NEW && (verdict == CTX_ACT_OK || verdict == DROP_POLICY_AUTH_REQUIRED)) {
 		ct_state_new.src_sec_id = HOST_ID;
-		ret = ct_create4(get_ct_map4(&tuple), &CT_MAP_ANY4, &tuple,
+		ret = ct_create4(get_ct_map4(tuple), &CT_MAP_ANY4, tuple,
 				 ctx, CT_EGRESS, &ct_state_new, proxy_port > 0, false,
 				 verdict == DROP_POLICY_AUTH_REQUIRED);
 		if (IS_ERR(ret))
 			return ret;
-	} else if (verdict == DROP_POLICY_AUTH_REQUIRED && !ct_state.auth_required) {
+	} else if (verdict == DROP_POLICY_AUTH_REQUIRED && !ct_state->auth_required) {
 		/* Accept if policy states auth is required and CT states it is granted. */
 		verdict = CTX_ACT_OK;
 	}
 
 	/* Emit verdict if drop or if allow for CT_NEW or CT_REOPENED. */
 	if (verdict != CTX_ACT_OK || ret != CT_ESTABLISHED)
-		send_policy_verdict_notify(ctx, dst_id, tuple.dport,
-					   tuple.nexthdr, POLICY_EGRESS, 0,
+		send_policy_verdict_notify(ctx, dst_id, tuple->dport,
+					   tuple->nexthdr, POLICY_EGRESS, 0,
 					   verdict, proxy_port, policy_match_type, audited);
 	return verdict;
+}
+
+static __always_inline int
+ipv4_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
+			__u32 ipcache_srcid __maybe_unused,
+			struct trace_ctx *trace, __s8 *ext_err)
+{
+	struct ct_buffer4 ct_buffer = {};
+	void *data, *data_end;
+	struct iphdr *ip4;
+
+	if (src_id != HOST_ID) {
+#  ifndef ENABLE_MASQUERADE
+		return whitelist_snated_egress_connections(ctx, ipcache_srcid,
+							   trace);
+#  else
+		/* Only enforce host policies for packets from host IPs. */
+		return CTX_ACT_OK;
+#  endif
+	}
+
+	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+		return DROP_INVALID;
+
+	ipv4_host_policy_egress_lookup(ctx, ip4, &ct_buffer);
+	if (ct_buffer.ret < 0)
+		return ct_buffer.ret;
+
+	return __ipv4_host_policy_egress(ctx, ip4, &ct_buffer, trace, ext_err);
 }
 
 static __always_inline bool
