@@ -234,10 +234,10 @@ ipv6_host_policy_ingress(struct __ctx_buff *ctx, __u32 *src_id,
 #  ifndef ENABLE_MASQUERADE
 static __always_inline int
 whitelist_snated_egress_connections(struct __ctx_buff *ctx, __u32 ipcache_srcid,
-				    struct trace_ctx *trace)
+				    struct ct_buffer4 *ct_buffer)
 {
-	struct ct_state ct_state_new = {}, ct_state = {};
-	struct ipv4_ct_tuple tuple = {};
+	struct ct_state ct_state_new = {};
+	struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
 	void *data, *data_end;
 	struct iphdr *ip4;
 	int ret, l4_off;
@@ -256,22 +256,20 @@ whitelist_snated_egress_connections(struct __ctx_buff *ctx, __u32 ipcache_srcid,
 		if (!revalidate_data(ctx, &data, &data_end, &ip4))
 			return DROP_INVALID;
 
-		tuple.nexthdr = ip4->protocol;
-		tuple.daddr = ip4->daddr;
-		tuple.saddr = ip4->saddr;
+		tuple->nexthdr = ip4->protocol;
+		tuple->daddr = ip4->daddr;
+		tuple->saddr = ip4->saddr;
 		l4_off = ETH_HLEN + ipv4_hdrlen(ip4);
-		ret = ct_lookup4(get_ct_map4(&tuple), &tuple, ctx, l4_off,
-				 CT_EGRESS, &ct_state, &trace->monitor);
-		if (ret < 0)
-			return ret;
+		ct_buffer->ret = ct_lookup4(get_ct_map4(tuple), tuple, ctx, l4_off,
+					    CT_EGRESS, &ct_buffer->ct_state, &ct_buffer->monitor);
+		if (ct_buffer->ret < 0)
+			return ct_buffer->ret;
 
-		trace->reason = (enum trace_reason)ret;
-
-		if (ret == CT_NEW) {
-			ret = ct_create4(get_ct_map4(&tuple), &CT_MAP_ANY4,
-					 &tuple, ctx, CT_EGRESS, &ct_state_new,
+		if (ct_buffer->ret == CT_NEW) {
+			ret = ct_create4(get_ct_map4(tuple), &CT_MAP_ANY4,
+					 tuple, ctx, CT_EGRESS, &ct_state_new,
 					 false, false, false);
-			if (IS_ERR(ret))
+			if (unlikely(ret < 0))
 				return ret;
 		}
 	}
@@ -359,11 +357,17 @@ ipv4_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
 	struct ct_buffer4 ct_buffer = {};
 	void *data, *data_end;
 	struct iphdr *ip4;
+	int __maybe_unused ret;
 
 	if (src_id != HOST_ID) {
 #  ifndef ENABLE_MASQUERADE
-		return whitelist_snated_egress_connections(ctx, ipcache_srcid,
-							   trace);
+		ret = whitelist_snated_egress_connections(ctx, ipcache_srcid,
+							  &ct_buffer);
+		if (ret >= 0) {
+			trace->monitor = ct_buffer.monitor;
+			trace->reason = (enum trace_reason)ct_buffer.ret;
+		}
+		return ret;
 #  else
 		/* Only enforce host policies for packets from host IPs. */
 		return CTX_ACT_OK;
