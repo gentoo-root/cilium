@@ -278,20 +278,36 @@ whitelist_snated_egress_connections(struct __ctx_buff *ctx, __u32 ipcache_srcid,
 }
 #   endif
 
-static __always_inline void
-ipv4_host_policy_egress_lookup(struct __ctx_buff *ctx, struct iphdr *ip4,
-			       struct ct_buffer4 *ct_buffer)
+static __always_inline int
+ipv4_host_policy_egress_lookup(struct __ctx_buff *ctx, __u32 src_id,
+			       __u32 ipcache_srcid __maybe_unused,
+			       struct iphdr **ip4, struct ct_buffer4 *ct_buffer)
 {
 	int l4_off, l3_off = ETH_HLEN;
 	struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
+	void *data, *data_end;
+
+	if (src_id != HOST_ID) {
+#  ifndef ENABLE_MASQUERADE
+		return whitelist_snated_egress_connections(ctx, ipcache_srcid,
+							   ct_buffer);
+#  else
+		/* Only enforce host policies for packets from host IPs. */
+		return CTX_ACT_OK;
+#  endif
+	}
+
+	if (!revalidate_data(ctx, &data, &data_end, ip4))
+		return DROP_INVALID;
 
 	/* Lookup connection in conntrack map. */
-	tuple->nexthdr = ip4->protocol;
-	tuple->daddr = ip4->daddr;
-	tuple->saddr = ip4->saddr;
-	l4_off = l3_off + ipv4_hdrlen(ip4);
+	tuple->nexthdr = (*ip4)->protocol;
+	tuple->daddr = (*ip4)->daddr;
+	tuple->saddr = (*ip4)->saddr;
+	l4_off = l3_off + ipv4_hdrlen(*ip4);
 	ct_buffer->ret = ct_lookup4(get_ct_map4(tuple), tuple, ctx, l4_off, CT_EGRESS,
 				    &ct_buffer->ct_state, &ct_buffer->monitor);
+	return ct_buffer->ret;
 }
 
 static __always_inline int
@@ -351,35 +367,28 @@ __ipv4_host_policy_egress(struct __ctx_buff *ctx, struct iphdr *ip4,
 
 static __always_inline int
 ipv4_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
-			__u32 ipcache_srcid __maybe_unused,
+			__u32 ipcache_srcid,
 			struct trace_ctx *trace, __s8 *ext_err)
 {
 	struct ct_buffer4 ct_buffer = {};
-	void *data, *data_end;
 	struct iphdr *ip4;
-	int __maybe_unused ret;
+	int ret;
+
+	ret = ipv4_host_policy_egress_lookup(ctx, src_id, ipcache_srcid,
+					     &ip4, &ct_buffer);
+	if (ret < 0)
+		return ret;
 
 	if (src_id != HOST_ID) {
 #  ifndef ENABLE_MASQUERADE
-		ret = whitelist_snated_egress_connections(ctx, ipcache_srcid,
-							  &ct_buffer);
-		if (ret >= 0) {
-			trace->monitor = ct_buffer.monitor;
-			trace->reason = (enum trace_reason)ct_buffer.ret;
-		}
-		return ret;
-#  else
-		/* Only enforce host policies for packets from host IPs. */
-		return CTX_ACT_OK;
+		trace->monitor = ct_buffer.monitor;
+		trace->reason = (enum trace_reason)ct_buffer.ret;
 #  endif
+		return ret;
 	}
 
-	if (!revalidate_data(ctx, &data, &data_end, &ip4))
-		return DROP_INVALID;
-
-	ipv4_host_policy_egress_lookup(ctx, ip4, &ct_buffer);
-	if (ct_buffer.ret < 0)
-		return ct_buffer.ret;
+	trace->monitor = ct_buffer.monitor;
+	trace->reason = (enum trace_reason)ct_buffer.ret;
 
 	return __ipv4_host_policy_egress(ctx, ip4, &ct_buffer, trace, ext_err);
 }
