@@ -158,70 +158,55 @@ struct {
 } CT_TAIL_CALL_BUFFER6 __section_maps_btf;
 
 static __always_inline int
-handle_ipv6(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
-	    __s8 *ext_err __maybe_unused)
+handle_ipv6_cont(struct __ctx_buff *ctx, __u32 secctx,
+		 __s8 *ext_err __maybe_unused)
 {
 	struct trace_ctx __maybe_unused trace = {
 		.reason = TRACE_REASON_UNKNOWN,
 		.monitor = TRACE_PAYLOAD_LEN,
 	};
-	struct remote_endpoint_info *info = NULL;
+	__u32 from_host_raw = ctx_load_meta(ctx, CB_FROM_HOST);
+	bool from_host;
+	struct ct_buffer6 __maybe_unused *ct_buffer;
 	void *data, *data_end;
 	struct ipv6hdr *ip6;
 	union v6addr *dst;
-	__u32 __maybe_unused remote_id = WORLD_ID;
-	int ret, l3_off = ETH_HLEN, hdrlen;
+	int l3_off = ETH_HLEN;
+	struct remote_endpoint_info *info = NULL;
 	struct endpoint_info *ep;
-	__u8 nexthdr;
+	int ret;
+
+	from_host = from_host_raw & FROM_HOST_FLAG_FROM_HOST;
+
+	ctx_store_meta(ctx, CB_FROM_HOST, 0);
 
 	if (!revalidate_data(ctx, &data, &data_end, &ip6))
 		return DROP_INVALID;
 
-	nexthdr = ip6->nexthdr;
-	hdrlen = ipv6_hdrlen(ctx, &nexthdr);
-	if (hdrlen < 0)
-		return hdrlen;
-
-	if (likely(nexthdr == IPPROTO_ICMPV6)) {
-		ret = icmp6_host_handle(ctx);
-		if (ret == SKIP_HOST_FIREWALL)
-			goto skip_host_firewall;
-		if (IS_ERR(ret))
-			return ret;
-	}
-
-#ifdef ENABLE_NODEPORT
-	if (!from_host) {
-		if (!ctx_skip_nodeport(ctx)) {
-			ret = nodeport_lb6(ctx, secctx);
-			/* nodeport_lb6() returns with TC_ACT_REDIRECT for
-			 * traffic to L7 LB. Policy enforcement needs to take
-			 * place after L7 LB has processed the packet, so we
-			 * return to stack immediately here with
-			 * TC_ACT_REDIRECT.
-			 */
-			if (ret < 0 || ret == TC_ACT_REDIRECT)
-				return ret;
-		}
-		/* Verifier workaround: modified ctx access. */
-		if (!revalidate_data(ctx, &data, &data_end, &ip6))
-			return DROP_INVALID;
-	}
-#endif /* ENABLE_NODEPORT */
-
 #ifdef ENABLE_HOST_FIREWALL
-	if (from_host) {
-		ret = ipv6_host_policy_egress(ctx, secctx, &trace, ext_err);
-		if (IS_ERR(ret))
-			return ret;
-	} else if (!ctx_skip_host_fw(ctx)) {
-		ret = ipv6_host_policy_ingress(ctx, &remote_id, &trace);
+	if (from_host_raw & FROM_HOST_FLAG_NEED_HOSTFW) {
+		__u32 remote_id = WORLD_ID;
+		__u32 zero = 0;
+
+		ct_buffer = map_lookup_elem(&CT_TAIL_CALL_BUFFER6, &zero);
+		if (!ct_buffer)
+			return DROP_INVALID_TC_BUFFER;
+		if (ct_buffer->tuple.saddr.d1 == 0 && ct_buffer->tuple.saddr.d2 == 0)
+			/* The map value is zeroed so the map update didn't happen somehow. */
+			return DROP_INVALID_TC_BUFFER;
+
+		trace.monitor = ct_buffer->monitor;
+		trace.reason = (enum trace_reason)ct_buffer->ret;
+
+		if (from_host)
+			ret = __ipv6_host_policy_egress(ctx, ip6, ct_buffer, &trace, ext_err);
+		else
+			ret = __ipv6_host_policy_ingress(ctx, ip6, ct_buffer, &remote_id, &trace);
 		if (IS_ERR(ret))
 			return ret;
 	}
 #endif /* ENABLE_HOST_FIREWALL */
 
-skip_host_firewall:
 /*
  * Perform SRv6 Decap if incoming skb is a known SID.
  * This must tailcall, as the decap could be for inner ipv6 or ipv4 making
@@ -241,6 +226,12 @@ skip_host_firewall:
 		}
 	}
 #endif /* ENABLE_SRV6 */
+
+#ifndef ENABLE_HOST_ROUTING
+	/* See the equivalent v4 path for comments */
+	if (!from_host)
+		return CTX_ACT_OK;
+#endif /* !ENABLE_HOST_ROUTING */
 
 #ifndef ENABLE_HOST_ROUTING
 	/* See the equivalent v4 path for comments */
@@ -325,8 +316,8 @@ skip_host_firewall:
 	return CTX_ACT_OK;
 }
 
-static __always_inline int
-tail_handle_ipv6(struct __ctx_buff *ctx, const bool from_host)
+declare_tailcall_if(is_defined(ENABLE_HOST_FIREWALL), CILIUM_CALL_IPV6_CONT)
+int tail_handle_ipv6_cont(struct __ctx_buff *ctx)
 {
 	__u32 proxy_identity = ctx_load_meta(ctx, CB_SRC_LABEL);
 	int ret;
@@ -334,10 +325,113 @@ tail_handle_ipv6(struct __ctx_buff *ctx, const bool from_host)
 
 	ctx_store_meta(ctx, CB_SRC_LABEL, 0);
 
-	ret = handle_ipv6(ctx, proxy_identity, from_host, &ext_err);
+	ret = handle_ipv6_cont(ctx, proxy_identity, &ext_err);
 	if (IS_ERR(ret))
 		return send_drop_notify_error_ext(ctx, proxy_identity, ret, ext_err,
 						  CTX_ACT_DROP, METRIC_INGRESS);
+	return ret;
+}
+
+static __always_inline int
+handle_ipv6(struct __ctx_buff *ctx, __u32 secctx, const bool from_host)
+{
+	struct ct_buffer6 __maybe_unused ct_buffer = {};
+	void *data, *data_end;
+	struct ipv6hdr *ip6;
+	int ret, hdrlen;
+	__u8 nexthdr;
+	bool need_hostfw = false;
+
+	if (!revalidate_data(ctx, &data, &data_end, &ip6))
+		return DROP_INVALID;
+
+	nexthdr = ip6->nexthdr;
+	hdrlen = ipv6_hdrlen(ctx, &nexthdr);
+	if (hdrlen < 0)
+		return hdrlen;
+
+	if (likely(nexthdr == IPPROTO_ICMPV6)) {
+		ret = icmp6_host_handle(ctx);
+		if (ret == SKIP_HOST_FIREWALL)
+			goto skip_host_firewall;
+		if (IS_ERR(ret))
+			return ret;
+	}
+
+#ifdef ENABLE_NODEPORT
+	if (!from_host) {
+		if (!ctx_skip_nodeport(ctx)) {
+			ret = nodeport_lb6(ctx, secctx);
+			/* nodeport_lb6() returns with TC_ACT_REDIRECT for
+			 * traffic to L7 LB. Policy enforcement needs to take
+			 * place after L7 LB has processed the packet, so we
+			 * return to stack immediately here with
+			 * TC_ACT_REDIRECT.
+			 */
+			if (ret < 0 || ret == TC_ACT_REDIRECT)
+				return ret;
+		}
+		/* Verifier workaround: modified ctx access. */
+		if (!revalidate_data(ctx, &data, &data_end, &ip6))
+			return DROP_INVALID;
+	}
+#endif /* ENABLE_NODEPORT */
+
+#ifdef ENABLE_HOST_FIREWALL
+	if (from_host) {
+		if (secctx == HOST_ID) {
+			if (!revalidate_data(ctx, &data, &data_end, &ip6))
+				return DROP_INVALID;
+
+			ipv6_host_policy_egress_lookup(ctx, ip6, &ct_buffer);
+			if (ct_buffer.ret < 0)
+				return ct_buffer.ret;
+			need_hostfw = true;
+		}
+	} else if (!ctx_skip_host_fw(ctx)) {
+#ifndef ENABLE_NODEPORT /* Revalidated in the previous block. */
+		if (!revalidate_data(ctx, &data, &data_end, &ip6))
+			return DROP_INVALID;
+#endif /* !ENABLE_NODEPORT */
+
+		if (ipv6_host_policy_ingress_lookup(ctx, ip6, &ct_buffer)) {
+			if (ct_buffer.ret < 0)
+				return ct_buffer.ret;
+			need_hostfw = true;
+		}
+	}
+	if (need_hostfw) {
+		__u32 zero = 0;
+
+		if (map_update_elem(&CT_TAIL_CALL_BUFFER6, &zero, &ct_buffer, 0) < 0)
+			return DROP_INVALID_TC_BUFFER;
+	}
+#endif /* ENABLE_HOST_FIREWALL */
+
+skip_host_firewall:
+	ctx_store_meta(ctx, CB_FROM_HOST,
+		       (from_host ? FROM_HOST_FLAG_FROM_HOST : 0) |
+		       (need_hostfw ? FROM_HOST_FLAG_NEED_HOSTFW : 0));
+	ctx_store_meta(ctx, CB_SRC_LABEL, secctx);
+	return CTX_ACT_OK;
+}
+
+static __always_inline int
+tail_handle_ipv6(struct __ctx_buff *ctx, const bool from_host)
+{
+	__u32 proxy_identity = ctx_load_meta(ctx, CB_SRC_LABEL);
+	int ret;
+
+	ctx_store_meta(ctx, CB_SRC_LABEL, 0);
+
+	ret = handle_ipv6(ctx, proxy_identity, from_host);
+	if (IS_ERR(ret))
+		return send_drop_notify_error(ctx, proxy_identity, ret,
+					      CTX_ACT_DROP, METRIC_INGRESS);
+
+	if (ret == CTX_ACT_OK)
+		invoke_tailcall_if(is_defined(ENABLE_HOST_FIREWALL),
+				   CILIUM_CALL_IPV6_CONT, tail_handle_ipv6_cont);
 	return ret;
 }
 

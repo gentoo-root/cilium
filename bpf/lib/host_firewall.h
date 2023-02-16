@@ -41,8 +41,12 @@ __ipv6_host_policy_egress(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 			  struct trace_ctx *trace, __s8 *ext_err)
 {
 	struct ct_state ct_state_new = {};
-	struct ct_state *ct_state = &ct_buffer->ct_state;
-	struct ipv6_ct_tuple *tuple = &ct_buffer->tuple;
+#ifndef HAVE_DIRECT_ACCESS_TO_MAP_VALUES
+	struct ct_state ct_state_on_stack;
+	struct ipv6_ct_tuple tuple_on_stack;
+#endif
+	struct ct_state *ct_state;
+	struct ipv6_ct_tuple *tuple;
 	int ret = ct_buffer->ret;
 	int verdict;
 	__u8 policy_match_type = POLICY_MATCH_NONE;
@@ -50,6 +54,16 @@ __ipv6_host_policy_egress(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 	struct remote_endpoint_info *info;
 	__u32 dst_id = 0;
 	__u16 proxy_port = 0;
+
+#ifdef HAVE_DIRECT_ACCESS_TO_MAP_VALUES
+	ct_state = &ct_buffer->ct_state;
+	tuple = &ct_buffer->tuple;
+#else
+	memcpy(&tuple_on_stack, &ct_buffer->tuple, sizeof(tuple_on_stack));
+	tuple = &tuple_on_stack;
+	memcpy(&ct_state_on_stack, &ct_buffer->ct_state, sizeof(ct_state_on_stack));
+	ct_state = &ct_state_on_stack;
+#endif
 
 	trace->monitor = ct_buffer->monitor;
 	trace->reason = (enum trace_reason)ret;
@@ -154,14 +168,28 @@ __ipv6_host_policy_ingress(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 			   struct trace_ctx *trace)
 {
 	struct ct_state ct_state_new = {};
-	struct ct_state *ct_state = &ct_buffer->ct_state;
-	struct ipv6_ct_tuple *tuple = &ct_buffer->tuple;
+#ifndef HAVE_DIRECT_ACCESS_TO_MAP_VALUES
+	struct ct_state ct_state_on_stack;
+	struct ipv6_ct_tuple tuple_on_stack;
+#endif
+	struct ct_state *ct_state;
+	struct ipv6_ct_tuple *tuple;
 	int ret = ct_buffer->ret;
 	int verdict = CTX_ACT_OK;
 	__u8 policy_match_type = POLICY_MATCH_NONE;
 	__u8 audited = 0;
 	struct remote_endpoint_info *info;
 	__u16 proxy_port = 0;
+
+#ifdef HAVE_DIRECT_ACCESS_TO_MAP_VALUES
+	ct_state = &ct_buffer->ct_state;
+	tuple = &ct_buffer->tuple;
+#else
+	memcpy(&tuple_on_stack, &ct_buffer->tuple, sizeof(tuple_on_stack));
+	tuple = &tuple_on_stack;
+	memcpy(&ct_state_on_stack, &ct_buffer->ct_state, sizeof(ct_state_on_stack));
+	ct_state = &ct_state_on_stack;
+#endif
 
 	trace->monitor = ct_buffer->monitor;
 	trace->reason = (enum trace_reason)ret;
