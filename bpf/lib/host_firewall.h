@@ -281,16 +281,22 @@ whitelist_snated_egress_connections(struct __ctx_buff *ctx, __u32 ipcache_srcid,
 static __always_inline int
 ipv4_host_policy_egress_lookup(struct __ctx_buff *ctx, __u32 src_id,
 			       __u32 ipcache_srcid __maybe_unused,
-			       struct iphdr **ip4, struct ct_buffer4 *ct_buffer)
+			       struct iphdr **ip4, struct ct_buffer4 *ct_buffer,
+			       bool *fill_trace)
 {
 	int l4_off, l3_off = ETH_HLEN;
 	struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
 	void *data, *data_end;
 
+	*fill_trace = false;
+
 	if (src_id != HOST_ID) {
 #  ifndef ENABLE_MASQUERADE
-		return whitelist_snated_egress_connections(ctx, ipcache_srcid,
-							   ct_buffer);
+		int ret = whitelist_snated_egress_connections(ctx, ipcache_srcid,
+							      ct_buffer);
+
+		*fill_trace = ret >= 0;
+		return ret;
 #  else
 		/* Only enforce host policies for packets from host IPs. */
 		return CTX_ACT_OK;
@@ -307,6 +313,7 @@ ipv4_host_policy_egress_lookup(struct __ctx_buff *ctx, __u32 src_id,
 	l4_off = l3_off + ipv4_hdrlen(*ip4);
 	ct_buffer->ret = ct_lookup4(get_ct_map4(tuple), tuple, ctx, l4_off, CT_EGRESS,
 				    &ct_buffer->ct_state, &ct_buffer->monitor);
+	*fill_trace = ct_buffer->ret >= 0;
 	return ct_buffer->ret;
 }
 
@@ -316,8 +323,12 @@ __ipv4_host_policy_egress(struct __ctx_buff *ctx, struct iphdr *ip4,
 			  struct trace_ctx *trace, __s8 *ext_err)
 {
 	struct ct_state ct_state_new = {};
-	struct ct_state *ct_state = &ct_buffer->ct_state;
-	struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
+#ifndef HAVE_DIRECT_ACCESS_TO_MAP_VALUES
+	struct ct_state ct_state_on_stack;
+	struct ipv4_ct_tuple tuple_on_stack;
+#endif
+	struct ct_state *ct_state;
+	struct ipv4_ct_tuple *tuple;
 	int ret = ct_buffer->ret;
 	int verdict;
 	__u8 policy_match_type = POLICY_MATCH_NONE;
@@ -325,6 +336,16 @@ __ipv4_host_policy_egress(struct __ctx_buff *ctx, struct iphdr *ip4,
 	struct remote_endpoint_info *info;
 	__u32 dst_id = 0;
 	__u16 proxy_port = 0;
+
+#ifdef HAVE_DIRECT_ACCESS_TO_MAP_VALUES
+	ct_state = &ct_buffer->ct_state;
+	tuple = &ct_buffer->tuple;
+#else
+	memcpy(&tuple_on_stack, &ct_buffer->tuple, sizeof(tuple_on_stack));
+	tuple = &tuple_on_stack;
+	memcpy(&ct_state_on_stack, &ct_buffer->ct_state, sizeof(ct_state_on_stack));
+	ct_state = &ct_state_on_stack;
+#endif
 
 	trace->monitor = ct_buffer->monitor;
 	trace->reason = (enum trace_reason)ret;
@@ -372,23 +393,21 @@ ipv4_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
 {
 	struct ct_buffer4 ct_buffer = {};
 	struct iphdr *ip4;
+	bool fill_trace;
 	int ret;
 
 	ret = ipv4_host_policy_egress_lookup(ctx, src_id, ipcache_srcid,
-					     &ip4, &ct_buffer);
+					     &ip4, &ct_buffer, &fill_trace);
 	if (ret < 0)
 		return ret;
 
-	if (src_id != HOST_ID) {
-#  ifndef ENABLE_MASQUERADE
+	if (fill_trace) {
 		trace->monitor = ct_buffer.monitor;
 		trace->reason = (enum trace_reason)ct_buffer.ret;
-#  endif
-		return ret;
 	}
 
-	trace->monitor = ct_buffer.monitor;
-	trace->reason = (enum trace_reason)ct_buffer.ret;
+	if (src_id != HOST_ID)
+		return ret;
 
 	return __ipv4_host_policy_egress(ctx, ip4, &ct_buffer, trace, ext_err);
 }
@@ -430,8 +449,12 @@ __ipv4_host_policy_ingress(struct __ctx_buff *ctx, struct iphdr *ip4,
 			   struct trace_ctx *trace)
 {
 	struct ct_state ct_state_new = {};
-	struct ct_state *ct_state = &ct_buffer->ct_state;
-	struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
+#ifndef HAVE_DIRECT_ACCESS_TO_MAP_VALUES
+	struct ct_state ct_state_on_stack;
+	struct ipv4_ct_tuple tuple_on_stack;
+#endif
+	struct ct_state *ct_state;
+	struct ipv4_ct_tuple *tuple;
 	int ret = ct_buffer->ret;
 	int verdict = CTX_ACT_OK;
 	__u8 policy_match_type = POLICY_MATCH_NONE;
@@ -439,6 +462,16 @@ __ipv4_host_policy_ingress(struct __ctx_buff *ctx, struct iphdr *ip4,
 	struct remote_endpoint_info *info;
 	bool is_untracked_fragment = false;
 	__u16 proxy_port = 0;
+
+#ifdef HAVE_DIRECT_ACCESS_TO_MAP_VALUES
+	ct_state = &ct_buffer->ct_state;
+	tuple = &ct_buffer->tuple;
+#else
+	memcpy(&tuple_on_stack, &ct_buffer->tuple, sizeof(tuple_on_stack));
+	tuple = &tuple_on_stack;
+	memcpy(&ct_state_on_stack, &ct_buffer->ct_state, sizeof(ct_state_on_stack));
+	ct_state = &ct_state_on_stack;
+#endif
 
 	trace->monitor = ct_buffer->monitor;
 	trace->reason = (enum trace_reason)ret;

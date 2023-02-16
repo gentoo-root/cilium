@@ -60,6 +60,10 @@
 #include "lib/encrypt.h"
 #include "lib/wireguard.h"
 
+#define FROM_HOST_FLAG_FROM_HOST (1 << 0)
+#define FROM_HOST_FLAG_FILL_TRACE (1 << 1)
+#define FROM_HOST_FLAG_NEED_HOSTFW (1 << 2)
+
 static __always_inline bool allow_vlan(__u32 __maybe_unused ifindex, __u32 __maybe_unused vlan_id) {
 	VLAN_FILTER(ifindex, vlan_id);
 }
@@ -145,6 +149,13 @@ resolve_srcid_ipv6(struct __ctx_buff *ctx, __u32 srcid_from_proxy,
 		src_id = srcid_from_ipcache;
 	return src_id;
 }
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct ct_buffer6);
+	__uint(max_entries, 1);
+} CT_TAIL_CALL_BUFFER6 __section_maps_btf;
 
 static __always_inline int
 handle_ipv6(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
@@ -426,68 +437,66 @@ resolve_srcid_ipv4(struct __ctx_buff *ctx, __u32 srcid_from_proxy,
 	return src_id;
 }
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct ct_buffer4);
+	__uint(max_entries, 1);
+} CT_TAIL_CALL_BUFFER4 __section_maps_btf;
+
 static __always_inline int
-handle_ipv4(struct __ctx_buff *ctx, __u32 secctx,
-	    __u32 ipcache_srcid __maybe_unused, const bool from_host, __s8 *ext_err __maybe_unused)
+handle_ipv4_cont(struct __ctx_buff *ctx, __u32 secctx,
+		 __s8 *ext_err __maybe_unused)
 {
 	struct trace_ctx __maybe_unused trace = {
 		.reason = TRACE_REASON_UNKNOWN,
 		.monitor = TRACE_PAYLOAD_LEN,
 	};
-	struct remote_endpoint_info *info = NULL;
-	__u32 __maybe_unused remote_id = 0;
-	struct endpoint_info *ep;
+	__u32 from_host_raw = ctx_load_meta(ctx, CB_FROM_HOST);
+	bool from_host;
+	struct ct_buffer4 __maybe_unused *ct_buffer = NULL;
 	void *data, *data_end;
 	struct iphdr *ip4;
+	struct remote_endpoint_info *info;
+	struct endpoint_info *ep;
 	int ret;
+
+	from_host = from_host_raw & FROM_HOST_FLAG_FROM_HOST;
+
+	ctx_store_meta(ctx, CB_FROM_HOST, 0);
 
 	if (!revalidate_data(ctx, &data, &data_end, &ip4))
 		return DROP_INVALID;
 
-/* If IPv4 fragmentation is disabled
- * AND a IPv4 fragmented packet is received,
- * then drop the packet.
- */
-#ifndef ENABLE_IPV4_FRAGMENTS
-	if (ipv4_is_fragment(ip4))
-		return DROP_FRAG_NOSUPPORT;
-#endif
-
-#ifdef ENABLE_NODEPORT
-	if (!from_host) {
-		if (!ctx_skip_nodeport(ctx)) {
-			ret = nodeport_lb4(ctx, secctx);
-			if (ret == NAT_46X64_RECIRC) {
-				ctx_store_meta(ctx, CB_SRC_LABEL, secctx);
-				ep_tail_call(ctx, CILIUM_CALL_IPV6_FROM_NETDEV);
-				return DROP_MISSED_TAIL_CALL;
-			}
-
-			/* nodeport_lb4() returns with TC_ACT_REDIRECT for
-			 * traffic to L7 LB. Policy enforcement needs to take
-			 * place after L7 LB has processed the packet, so we
-			 * return to stack immediately here with
-			 * TC_ACT_REDIRECT.
-			 */
-			if (ret < 0 || ret == TC_ACT_REDIRECT)
-				return ret;
-		}
-		/* Verifier workaround: modified ctx access. */
-		if (!revalidate_data(ctx, &data, &data_end, &ip4))
-			return DROP_INVALID;
-	}
-#endif /* ENABLE_NODEPORT */
-
 #ifdef ENABLE_HOST_FIREWALL
-	if (from_host) {
-		/* We're on the egress path of cilium_host. */
-		ret = ipv4_host_policy_egress(ctx, secctx, ipcache_srcid,
-					      &trace, ext_err);
-		if (IS_ERR(ret))
-			return ret;
-	} else if (!ctx_skip_host_fw(ctx)) {
-		/* We're on the ingress path of the native device. */
-		ret = ipv4_host_policy_ingress(ctx, &remote_id, &trace);
+	if (from_host_raw & FROM_HOST_FLAG_FILL_TRACE) {
+		__u32 zero = 0;
+
+		ct_buffer = map_lookup_elem(&CT_TAIL_CALL_BUFFER4, &zero);
+		if (!ct_buffer)
+			return DROP_INVALID_TC_BUFFER;
+		if (ct_buffer->tuple.saddr == 0)
+			/* The map value is zeroed so the map update didn't happen somehow. */
+			return DROP_INVALID_TC_BUFFER;
+
+		trace.monitor = ct_buffer->monitor;
+		trace.reason = (enum trace_reason)ct_buffer->ret;
+	}
+
+	if (from_host_raw & FROM_HOST_FLAG_NEED_HOSTFW) {
+		__u32 remote_id = 0;
+
+		/* Vefifier is not smart enough to understand that need_hostfw
+		 * depends on fill_trace and that ct_buffer was set in the
+		 * previous block.
+		 */
+		if (!ct_buffer)
+			return DROP_INVALID_TC_BUFFER;
+
+		if (from_host)
+			ret = __ipv4_host_policy_egress(ctx, ip4, ct_buffer, &trace, ext_err);
+		else
+			ret = __ipv4_host_policy_ingress(ctx, ip4, ct_buffer, &remote_id, &trace);
 		if (IS_ERR(ret))
 			return ret;
 	}
@@ -608,8 +617,8 @@ skip_vtep:
 	return CTX_ACT_OK;
 }
 
-static __always_inline int
-tail_handle_ipv4(struct __ctx_buff *ctx, __u32 ipcache_srcid, const bool from_host)
+declare_tailcall_if(is_defined(ENABLE_HOST_FIREWALL), CILIUM_CALL_IPV4_CONT)
+int tail_handle_ipv4_cont(struct __ctx_buff *ctx)
 {
 	__u32 proxy_identity = ctx_load_meta(ctx, CB_SRC_LABEL);
 	int ret;
@@ -617,10 +626,116 @@ tail_handle_ipv4(struct __ctx_buff *ctx, __u32 ipcache_srcid, const bool from_ho
 
 	ctx_store_meta(ctx, CB_SRC_LABEL, 0);
 
-	ret = handle_ipv4(ctx, proxy_identity, ipcache_srcid, from_host, &ext_err);
+	ret = handle_ipv4_cont(ctx, proxy_identity, &ext_err);
 	if (IS_ERR(ret))
 		return send_drop_notify_error_ext(ctx, proxy_identity, ret, ext_err,
 						  CTX_ACT_DROP, METRIC_INGRESS);
+	return ret;
+}
+
+static __always_inline int
+handle_ipv4(struct __ctx_buff *ctx, __u32 secctx,
+	    __u32 ipcache_srcid __maybe_unused, const bool from_host)
+{
+	struct ct_buffer4 __maybe_unused ct_buffer = {};
+	void *data, *data_end;
+	struct iphdr *ip4;
+	bool need_hostfw = false;
+	bool fill_trace = false;
+
+	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+		return DROP_INVALID;
+
+/* If IPv4 fragmentation is disabled
+ * AND a IPv4 fragmented packet is received,
+ * then drop the packet.
+ */
+#ifndef ENABLE_IPV4_FRAGMENTS
+	if (ipv4_is_fragment(ip4))
+		return DROP_FRAG_NOSUPPORT;
+#endif
+
+#ifdef ENABLE_NODEPORT
+	if (!from_host) {
+		if (!ctx_skip_nodeport(ctx)) {
+			int ret = nodeport_lb4(ctx, secctx);
+
+			if (ret == NAT_46X64_RECIRC) {
+				ctx_store_meta(ctx, CB_SRC_LABEL, secctx);
+				ep_tail_call(ctx, CILIUM_CALL_IPV6_FROM_NETDEV);
+				return DROP_MISSED_TAIL_CALL;
+			}
+
+			/* nodeport_lb4() returns with TC_ACT_REDIRECT for
+			 * traffic to L7 LB. Policy enforcement needs to take
+			 * place after L7 LB has processed the packet, so we
+			 * return to stack immediately here with
+			 * TC_ACT_REDIRECT.
+			 */
+			if (ret < 0 || ret == TC_ACT_REDIRECT)
+				return ret;
+		}
+		/* Verifier workaround: modified ctx access. */
+		if (!revalidate_data(ctx, &data, &data_end, &ip4))
+			return DROP_INVALID;
+	}
+#endif /* ENABLE_NODEPORT */
+
+#ifdef ENABLE_HOST_FIREWALL
+	if (from_host) {
+		/* We're on the egress path of cilium_host. */
+		int ret = ipv4_host_policy_egress_lookup(ctx, secctx, ipcache_srcid,
+							 &ip4, &ct_buffer, &fill_trace);
+
+		if (IS_ERR(ret))
+			return ret;
+		need_hostfw = secctx == HOST_ID;
+	} else if (!ctx_skip_host_fw(ctx)) {
+#ifndef ENABLE_NODEPORT /* Revalidated in the previous block. */
+		if (!revalidate_data(ctx, &data, &data_end, &ip4))
+			return DROP_INVALID;
+#endif /* !ENABLE_NODEPORT */
+
+		/* We're on the ingress path of the native device. */
+		if (ipv4_host_policy_ingress_lookup(ctx, ip4, &ct_buffer)) {
+			if (ct_buffer.ret < 0)
+				return ct_buffer.ret;
+			fill_trace = true;
+			need_hostfw = true;
+		}
+	}
+	if (fill_trace) { /* need_hostfw depends on fill_trace */
+		__u32 zero = 0;
+
+		if (map_update_elem(&CT_TAIL_CALL_BUFFER4, &zero, &ct_buffer, 0) < 0)
+			return DROP_INVALID_TC_BUFFER;
+	}
+#endif /* ENABLE_HOST_FIREWALL */
+
+	ctx_store_meta(ctx, CB_FROM_HOST,
+		       (from_host ? FROM_HOST_FLAG_FROM_HOST : 0) |
+		       (fill_trace ? FROM_HOST_FLAG_FILL_TRACE : 0) |
+		       (need_hostfw ? FROM_HOST_FLAG_NEED_HOSTFW : 0));
+	ctx_store_meta(ctx, CB_SRC_LABEL, secctx);
+	return CTX_ACT_OK;
+}
+
+static __always_inline int
+tail_handle_ipv4(struct __ctx_buff *ctx, __u32 ipcache_srcid, const bool from_host)
+{
+	__u32 proxy_identity = ctx_load_meta(ctx, CB_SRC_LABEL);
+	int ret;
+
+	ctx_store_meta(ctx, CB_SRC_LABEL, 0);
+
+	ret = handle_ipv4(ctx, proxy_identity, ipcache_srcid, from_host);
+	if (IS_ERR(ret))
+		return send_drop_notify_error(ctx, proxy_identity, ret,
+					      CTX_ACT_DROP, METRIC_INGRESS);
+
+	if (ret == CTX_ACT_OK)
+		invoke_tailcall_if(is_defined(ENABLE_HOST_FIREWALL),
+				   CILIUM_CALL_IPV4_CONT, tail_handle_ipv4_cont);
 	return ret;
 }
 
